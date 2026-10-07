@@ -52,10 +52,13 @@ jobs:
                   Select-Object -First 1
           if (-not $proj) { throw "FreeSWITCH core project (FreeSwitchCore*.vcxproj) not found anywhere in the source tree" }
           Write-Host "Building $($proj.FullName)"
-          msbuild $proj.FullName /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64
+          # The project files expect to be built from the solution, which defines SolutionDir.
+          $sd = "$((Get-Location).Path)\\"
+          Write-Host "SolutionDir = $sd"
+          msbuild $proj.FullName /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$sd"
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Default toolset failed, retrying with the VS2022 toolset (v143)"
-            msbuild $proj.FullName /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+            msbuild $proj.FullName /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$sd" /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
             if ($LASTEXITCODE -ne 0) { throw "FreeSWITCH core build failed" }
           }
 
