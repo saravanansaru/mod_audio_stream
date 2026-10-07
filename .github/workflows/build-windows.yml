@@ -41,26 +41,61 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       # Builds the FreeSWITCH core so we get matching headers and the import library.
+      # It must be built through the official solution file (Freeswitch.2017.sln) so that
+      # dependencies are downloaded and built in the right order.
       - name: Build FreeSWITCH core
         shell: pwsh
         working-directory: fs
         run: |
-          Write-Host "Candidate core projects:"
-          Get-ChildItem . -Recurse -Filter '*.vcxproj' | Where-Object { $_.Name -like 'FreeSwitchCore*' } | ForEach-Object { Write-Host $_.FullName }
-          $proj = Get-ChildItem . -Recurse -Filter 'FreeSwitchCore*.vcxproj' |
-                  Sort-Object { if ($_.FullName -match 'w32') { 0 } else { 1 } } |
-                  Select-Object -First 1
-          if (-not $proj) { throw "FreeSWITCH core project (FreeSwitchCore*.vcxproj) not found anywhere in the source tree" }
-          Write-Host "Building $($proj.FullName)"
-          # The project files expect to be built from the solution, which defines SolutionDir.
-          $sd = "$((Get-Location).Path)\\"
-          Write-Host "SolutionDir = $sd"
-          msbuild $proj.FullName /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$sd"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Default toolset failed, retrying with the VS2022 toolset (v143)"
-            msbuild $proj.FullName /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$sd" /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
-            if ($LASTEXITCODE -ne 0) { throw "FreeSWITCH core build failed" }
+          $slnPath = 'Freeswitch.2017.sln'
+          $lines = Get-Content $slnPath
+
+          # Read project names and solution-folder nesting from the solution file.
+          $entries = @{}
+          foreach ($l in $lines) {
+            if ($l -match '^Project\("\{[^}]+\}"\)\s*=\s*"([^"]+)",\s*"([^"]+)",\s*"(\{[^}]+\})"') {
+              $entries[$Matches[3]] = @{ Name = $Matches[1]; Path = $Matches[2] }
+            }
           }
+          $nest = @{}
+          $inNest = $false
+          foreach ($l in $lines) {
+            if ($l -match 'GlobalSection\(NestedProjects\)') { $inNest = $true; continue }
+            if ($inNest -and $l -match 'EndGlobalSection') { $inNest = $false }
+            if ($inNest -and $l -match '^\s*(\{[^}]+\})\s*=\s*(\{[^}]+\})') { $nest[$Matches[1]] = $Matches[2] }
+          }
+
+          $core = $entries.GetEnumerator() | Where-Object { $_.Value.Path -like '*FreeSwitchCore.2017.vcxproj' } | Select-Object -First 1
+          $target = $null
+          if ($core) {
+            $g = $core.Key
+            $parts = @($core.Value.Name)
+            while ($nest.ContainsKey($g)) { $g = $nest[$g]; $parts = @($entries[$g].Name) + $parts }
+            $target = ($parts | ForEach-Object { $_ -replace '[%\$@;\.\(\)'']', '_' }) -join '\'
+          }
+
+          $ok = $false
+          if ($target) {
+            Write-Host "Core target in solution: $target"
+            # Two attempts: the first can fail on download/compile ordering, the second normally succeeds.
+            foreach ($attempt in 1..2) {
+              Write-Host "Core build attempt $attempt"
+              msbuild $slnPath "/t:$target" /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64
+              if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            }
+          } else {
+            Write-Host "Could not work out the core target name from the solution file."
+          }
+
+          if (-not $ok) {
+            Write-Host "Targeted build did not succeed; building the whole solution (takes longer)"
+            foreach ($attempt in 1..2) {
+              msbuild $slnPath /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64
+              if ($LASTEXITCODE -eq 0) { break }
+            }
+          }
+          # Do not fail here: unrelated modules may fail. The next step checks that the core library exists.
+          exit 0
 
       - name: Locate FreeSWITCH import library
         shell: pwsh
@@ -69,7 +104,10 @@ jobs:
                   Where-Object { $_.FullName -match 'x64' -and $_.FullName -match 'Release' }
           $libs | ForEach-Object { Write-Host "Found: $($_.FullName)" }
           $lib = $libs | Select-Object -First 1
-          if (-not $lib) { throw "No FreeSWITCH import .lib found after core build" }
+          if (-not $lib) {
+            Get-ChildItem fs -Recurse -Filter '*.lib' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*reeSwitch*' } | ForEach-Object { Write-Host "lib present: $($_.FullName)" }
+            throw "No FreeSWITCH import .lib found after core build"
+          }
           $p = $lib.FullName -replace '\\','/'
           "FS_LIB=$p" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
