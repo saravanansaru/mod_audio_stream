@@ -1,0 +1,158 @@
+# Save in your fork of amigniter/mod_audio_stream as:
+#   .github/workflows/build-windows.yml
+# Run it from the repo's Actions tab -> "Build mod_audio_stream (Windows)" -> Run workflow.
+#
+# STATUS: untested scaffold. The module is Linux-first, so the first run may fail
+# at the FreeSWITCH core build, the CMake configure, or the compile step.
+# Send me the failing log and I will adjust it.
+
+name: Build mod_audio_stream (Windows)
+
+on:
+  workflow_dispatch:
+
+env:
+  FS_TAG: v1.10.12
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    steps:
+      - name: Keep Unix line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Checkout module (with libwsc submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: mod
+
+      - name: Checkout FreeSWITCH source
+        uses: actions/checkout@v4
+        with:
+          repository: signalwire/freeswitch
+          ref: ${{ env.FS_TAG }}
+          path: fs
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # Builds the FreeSWITCH core so we get matching headers and the import library.
+      - name: Build FreeSWITCH core
+        shell: pwsh
+        working-directory: fs
+        run: |
+          $proj = Get-ChildItem src -Filter 'FreeSwitchCoreLib*.vcxproj' | Select-Object -First 1
+          if (-not $proj) { $proj = Get-ChildItem src -Filter 'FreeSwitchCore*.vcxproj' | Select-Object -First 1 }
+          if (-not $proj) { throw "FreeSWITCH core project not found under fs/src" }
+          Write-Host "Building $($proj.FullName)"
+          msbuild $proj.FullName /m /verbosity:minimal /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw "FreeSWITCH core build failed" }
+
+      - name: Locate FreeSWITCH import library
+        shell: pwsh
+        run: |
+          $libs = Get-ChildItem fs -Recurse -Include 'FreeSwitchCore.lib','FreeSwitch.lib','libfreeswitch.lib' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match 'x64' -and $_.FullName -match 'Release' }
+          $libs | ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          $lib = $libs | Select-Object -First 1
+          if (-not $lib) { throw "No FreeSWITCH import .lib found after core build" }
+          $p = $lib.FullName -replace '\\','/'
+          "FS_LIB=$p" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Install dependencies (vcpkg)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install libevent openssl zlib speexdsp --triplet x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+
+      # The repo's own CMake is Linux/pkg-config based, so we use a small Windows one.
+      - name: Write Windows CMakeLists
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force winbuild | Out-Null
+          @'
+          cmake_minimum_required(VERSION 3.15)
+          project(mod_audio_stream C CXX)
+
+          find_package(Libevent CONFIG REQUIRED)
+          find_package(OpenSSL REQUIRED)
+          find_package(ZLIB REQUIRED)
+          find_path(SPEEX_INC speex/speex_resampler.h)
+          find_library(SPEEX_LIB NAMES speexdsp libspeexdsp)
+          if(NOT SPEEX_INC OR NOT SPEEX_LIB)
+            message(FATAL_ERROR "speexdsp not found")
+          endif()
+
+          file(GLOB_RECURSE WSC_SOURCES "${MOD_DIR}/libs/*.cpp" "${MOD_DIR}/libs/*.c")
+          list(FILTER WSC_SOURCES EXCLUDE REGEX "/(examples|example|test|tests|docs)/")
+          file(GLOB_RECURSE WSC_HEADERS "${MOD_DIR}/libs/*.h" "${MOD_DIR}/libs/*.hpp")
+          set(WSC_INCLUDES "")
+          foreach(h ${WSC_HEADERS})
+            get_filename_component(d "${h}" DIRECTORY)
+            list(APPEND WSC_INCLUDES "${d}")
+          endforeach()
+          list(REMOVE_DUPLICATES WSC_INCLUDES)
+
+          add_library(mod_audio_stream SHARED
+            ${MOD_DIR}/mod_audio_stream.c
+            ${MOD_DIR}/audio_streamer_glue.cpp
+            ${MOD_DIR}/base64.cpp
+            ${WSC_SOURCES})
+
+          set_target_properties(mod_audio_stream PROPERTIES PREFIX "" CXX_STANDARD 17)
+
+          target_compile_definitions(mod_audio_stream PRIVATE
+            _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+          target_compile_options(mod_audio_stream PRIVATE /EHsc /bigobj)
+
+          target_include_directories(mod_audio_stream PRIVATE
+            ${MOD_DIR}
+            ${WSC_INCLUDES}
+            ${SPEEX_INC}
+            ${FS_DIR}/src/include
+            ${FS_DIR}/libs/libteletone/src
+            ${FS_DIR}/libs/apr/include
+            ${FS_DIR}/libs/apr-util/include)
+
+          target_link_libraries(mod_audio_stream PRIVATE
+            ${FS_LIB}
+            libevent::core libevent::extra
+            OpenSSL::SSL OpenSSL::Crypto
+            ZLIB::ZLIB
+            ${SPEEX_LIB}
+            ws2_32 crypt32 iphlpapi)
+          if(TARGET libevent::openssl)
+            target_link_libraries(mod_audio_stream PRIVATE libevent::openssl)
+          endif()
+          '@ | Set-Content -Encoding utf8 winbuild/CMakeLists.txt
+
+      - name: Configure and build module
+        shell: pwsh
+        run: |
+          $ws  = $env:GITHUB_WORKSPACE -replace '\\','/'
+          $tc  = ($env:VCPKG_INSTALLATION_ROOT -replace '\\','/') + '/scripts/buildsystems/vcpkg.cmake'
+          cmake -S winbuild -B winbuild/out -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$tc" -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DMOD_DIR="$ws/mod" -DFS_DIR="$ws/fs" -DFS_LIB="$env:FS_LIB"
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+          cmake --build winbuild/out --config Release
+          if ($LASTEXITCODE -ne 0) { throw "Module build failed" }
+
+      - name: Collect output
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/mod | Out-Null
+          Copy-Item winbuild/out/Release/mod_audio_stream.dll dist/mod/
+          # dependency DLLs go next to FreeSwitchConsole.exe on the server
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*.dll" dist/
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mod_audio_stream-win-x64-fs1.10.12
+          path: dist
